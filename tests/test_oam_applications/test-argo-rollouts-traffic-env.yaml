@@ -1,0 +1,194 @@
+apiVersion: core.oam.dev/v1beta1
+kind: Application
+metadata:
+  name: rollouts-poc
+spec:
+  components:
+    - name: rollouts-poc
+      type: rollouts
+      properties:
+        # Basic configuration
+        # image: nginx-with-stub:latest
+        # imagePullSecrets: ["my-secret"]
+        image: argoproj/rollouts-demo:blue
+        imagePullPolicy: IfNotPresent
+        replicas: 3
+        revisionHistoryLimit: 3
+        labels:
+          app: rollouts-poc
+        # Commands and arguments
+        # cmd: ["/bin/sh", "-c", "sleep", "infinity"]
+        # Container configuration
+        ports:
+          - port: 80
+            expose: true
+            name: http
+          - port: 443
+            expose: false
+            name: https
+            protocol: TCP
+          - port: 8080
+            expose: true
+            name: listener
+        # Environment variables
+        env:
+          - name: ENV_TYPE
+            value: "production"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: "metadata.name"
+
+        # Resource configuration
+        cpuRequest: "5m"
+        memoryRequest: "32Mi"
+        # Volume mounts
+        volumeMounts:
+          configMap:
+            - name: config-volume
+              mountPath: /app/config
+              cmName: rollouts-poc-config
+          secret:
+            - name: secrets-volume
+              mountPath: /app/secrets
+              secretName: rollouts-poc-secret
+              readOnly: true
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        startupProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 10
+        # Container security context
+        securityContext:
+          ## Not recommended for live env. Just for testing
+          runAsNonRoot: false
+          # runAsUser: 1000
+          allowPrivilegeEscalation: true
+          # capabilities:
+          #   drop: ["ALL"]
+        # Monitoring configuration
+        prometheusPort: 9090
+        prometheusPath: "/metrics"
+        # Progressive delivery strategy
+        strategy:
+          type: "Canary"
+          canary:
+            canaryService: rollouts-poc-canary
+            stableService: rollouts-poc-stable
+            trafficRouting:
+              nginx:
+                stableIngress: rollouts-poc-stable
+                additionalIngressAnnotations:
+                  nginx.ingress.kubernetes.io/canary: "true"
+            canaryMetadata:
+              annotations:
+                argorollouts.kubernetes.io/identifier: rollouts-canary
+            stableMetadata:
+              annotations:
+                argorollouts.kubernetes.io/identifier: rollouts-stable
+            analysis:
+              templates:
+                - templateName: success-rate-analysis
+              startingStep: 2
+              args:
+                - name: ingress-name
+                  value: rollouts-poc-stable
+            steps:
+              - setWeight: 20
+              - pause: { duration: "5m" }
+              - setWeight: 40
+              - analysis:
+                  templates:
+                    - templateName: latency-analysis
+                  args:
+                    - name: ingress-name
+                      value: rollouts-poc-stable
+              - setWeight: 60
+              - pause: { duration: "3m" }
+              - setWeight: 80
+              - pause: { duration: "5m" }
+        # Ingress configuration
+        ingress:
+          class: nginx
+          domains:
+            - domain: rollouts-poc.mycustomdomain.net
+              http:
+                "/": 8080
+              pathType: Prefix
+          annotations:
+            kubernetes.io/ingress.class: nginx
+            nginx.ingress.kubernetes.io/ssl-redirect: "false"
+        # Node scheduling
+        tolerations:
+          - effect: NoSchedule
+            key: custom-domain
+            value: "true"
+
+      traits:
+        # Environment variables from ConfigMap and Secret
+        - type: envfrom
+          properties:
+            # ConfigMap example
+            configMaps:
+              - name: "rollouts-poc-config"
+                data:
+                  DATABASE_URL: "postgresql://localhost:5432/mydb"
+                  API_ENDPOINT: "https://api.mycustomdomain.net"
+                  LOG_LEVEL: "INFO"
+            # Secret example
+            secrets:
+              - name: "rollouts-poc-secret"
+                stringData:
+                  DB_PASSWORD: "my-secure-password"
+                  API_KEY: "my-api-key"
+        # Analysis templates
+        - type: analysistemplate
+          properties:
+            name: success-rate-analysis
+            namespace: rollouts-poc
+            args:
+              - name: ingress-name
+            metrics:
+              - name: success-rate
+                interval: 1m
+                successcondition: "result[0] >= 0.95"
+                failurelimit: 3
+                provider:
+                  address: http://prometheus-prometheus.monitoring.svc:9090
+                  query: |
+                    sum(rate(nginx_ingress_controller_requests{ingress="{{args.ingress-name}}", status!~"[4-5].*"}[2m])) by (ingress) /
+                    sum(rate(nginx_ingress_controller_requests{ingress="{{args.ingress-name}}"}[2m])) by (ingress)
+
+        - type: analysistemplate
+          properties:
+            name: latency-analysis
+            namespace: rollouts-poc
+            args:
+              - name: ingress-name
+            metrics:
+              - name: p99
+                interval: 1m
+                successcondition: "result[0] <= 5"
+                count: 2
+                failurelimit: 1
+                provider:
+                  address: http://prometheus-prometheus.monitoring.svc:9090
+                  query: |
+                    histogram_quantile(0.99, sum by(le) (rate(nginx_ingress_controller_request_duration_seconds_bucket{ingress=~"{{args.ingress-name}}"}[1m]))) * 1000
