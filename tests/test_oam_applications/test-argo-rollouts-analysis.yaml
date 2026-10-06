@@ -1,0 +1,219 @@
+apiVersion: core.oam.dev/v1beta1
+kind: Application
+metadata:
+  name: rollout-canary-demo
+  namespace: default
+spec:
+  components:
+    - name: my-canary-app
+      type: rollouts
+      properties:
+        # Basic configuration
+        image: nginx:1.21.0
+        replicas: 3
+        # Labels and annotations
+        labels:
+          tier: frontend
+          environment: production
+        annotations:
+          description: "Production web frontend"
+          config-version: "v1.2.3"
+        # Image pull configuration
+        imagePullPolicy: "IfNotPresent"
+        # Commands and arguments
+        cmd: ["/bin/sh", "-c"]
+        args: ["nginx -g 'daemon off;'"]
+        # Port configuration
+        ports:
+          - port: 80
+            expose: true
+            name: http
+          - port: 443
+            expose: true
+            name: https
+            protocol: TCP
+          - port: 8080
+            expose: false
+            name: admin
+        # Resource configuration
+        cpuRequest: "100m"
+        cpuLimit: "500m"
+        memoryRequest: "128Mi"
+        memoryLimit: "512Mi"
+        # Environment variables
+        env:
+          - name: ENV_TYPE
+            value: "production"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: "metadata.name"
+          - name: SECRET_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: app-secrets
+                key: api-token
+          - name: CONFIG_PATH
+            valueFrom:
+              configMapKeyRef:
+                name: app-config
+                key: config-path
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        startupProbe:
+          tcpSocket:
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 10
+
+        # Container security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        # Monitoring configuration
+        prometheusPort: 9090
+        prometheusPath: "/metrics"
+        # Progressive delivery strategy
+        strategy:
+          type: "Canary"
+          canary:
+            stableService: "my-stable-app"
+            canaryService: "my-canary-app"
+            # Custom metadata for canary pods
+            canaryMetadata:
+              annotations:
+                version: "v2"
+                prometheus.io/scrape: 'true'
+                prometheus.io/port: '9090'
+              labels:
+                version: "canary"
+                environment: "dev"
+            # Custom metadata for stable pods
+            stableMetadata:
+              annotations:
+                version: "v1"
+                prometheus.io/scrape: 'true'
+                prometheus.io/port: '9090'
+              labels:
+                version: "stable"
+                environment: "production"
+            maxSurge: 1
+            maxUnavailable: 0
+            scaleDownDelaySeconds: 60
+            # Analysis during canary deployment
+            analysis:
+              templates:
+                - templateName: "success-rate"
+              args:
+                - name: "service-name"
+                  value: "my-canary-app"
+                - name: "success-threshold"
+                  value: "98"
+              successfulRunHistoryLimit: 3
+              unsuccessfulRunHistoryLimit: 1
+            # Progressive traffic shifting steps
+            steps:
+              - setWeight: 20
+              - pause:
+                  duration: "30s"
+              - setCanaryScale:
+                  weight: 20
+                  matchTrafficWeight: true
+              - setWeight: 40
+              - analysis:
+                  templates:
+                    - templateName: latency-analysis
+                  args:
+                    - name: ingress-name
+                      value: rollouts-poc-stable
+              - pause:
+                  duration: "60s"
+              - setWeight: 60
+              - pause:
+                  duration: "60s"
+              - setWeight: 80
+              - pause:
+                  duration: "60s"
+              - setWeight: 100
+            # Traffic routing configuration
+            trafficRouting:
+              nginx:
+                stableIngress: "my-canary-app-ingress"
+                additionalIngressAnnotations:
+                  nginx.ingress.kubernetes.io/canary: "true"
+                  nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+                  nginx.ingress.kubernetes.io/enable-cors: "true"
+        # Ingress configuration
+        ingress:
+          domains:
+            - domain: canary-app.example.com
+              http:
+                "/": 80
+          class: "nginx"
+          annotations:
+            kubernetes.io/tls-acme: "true"
+          tls:
+            - hosts:
+                - canary-app.example.com
+              secretName: canary-app-tls
+      traits:
+        - type: analysistemplate
+          properties:
+            name: success-rate
+            namespace: default
+            args:
+              - name: service-name
+                value: guestbook-svc.default.svc.cluster.local
+            dryRunMetricName: [total-5xx-errors, total-4xx-errors]
+            templates:
+              - templateName: P99-latency
+            metrics:
+              - name: "success-rate"
+                interval: "60s"
+                successCondition: "result[0] >= 0.95"
+                count: 5
+                annotations:
+                  one.example.com/annotation: "test"
+                provider:
+                    query: |
+                      sum(rate(http_requests_total{status=~"2.*", service="{{args.service-name}}"}[5m]))
+                      /
+                      sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
+        - type: analysistemplate
+          properties:
+            name: latency-analysis
+            namespace: default
+            args:
+              - name: ingress-name
+                value: rollouts-poc-stable
+            dryRunMetricName: [p99-latency]
+            templates:
+              - templateName: P99-latency
+            metrics:
+              - name: "p99-latency"
+                interval: "60s"
+                successCondition: "result[0] < 200"
+                count: 5
+                provider:
+                    query: |
+                      histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{ingress="{{args.ingress-name}}"}[5m])) by (le))

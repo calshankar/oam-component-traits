@@ -1,0 +1,48 @@
+apiVersion: core.oam.dev/v1beta1
+kind: Application
+metadata:
+  name: analysistemplate-test
+  namespace: default
+spec:
+  components:
+    - name: analysistemplate-test
+      type: webservice
+      properties:
+        image: ghcr.io/stefanprodan/podinfo:6.0.0
+        ports:
+        - port: 8080
+#          expose: true
+        livenessProbe:
+          initialDelaySeconds: 12
+          periodSeconds: 10
+          timeoutSeconds: 2
+          httpGet:
+            path: /healthz
+            port: 8080
+        readinessProbe:
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          httpGet:
+            path: /ready
+            port: 8080
+      traits:
+        - type: analysistemplate
+          properties:
+            name: total-5xx-errors
+            namespace: default
+            args:
+              - name: service-name
+                value: guestbook-svc.default.svc.cluster.local
+            dryRunMetricName: [total-5xx-errors, total-4xx-errors]
+            templates:
+              - templateName: P99-latency
+            metrics:
+              - name: error-rate
+                interval: 5m
+                count: 2
+                provider:
+                  query: |
+                    histogram_quantile(0.99, sum by(le) (rate(nginx_ingress_controller_request_duration_seconds_bucket{ingress=~"{{args.ingress-name}}"}[1m]))) * 1000
+            annotations:
+              one.example.com/annotation: "test"
